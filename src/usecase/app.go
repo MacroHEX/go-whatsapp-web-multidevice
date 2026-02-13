@@ -15,7 +15,6 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/websocket"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
 	fiberUtils "github.com/gofiber/fiber/v2/utils"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/sirupsen/logrus"
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/libsignal/logger"
@@ -45,17 +44,11 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 		return response, pkgError.ErrAlreadyLoggedIn
 	}
 
-	// Disconnect first to ensure QR flow starts cleanly.
 	client.Disconnect()
 
-	// Use a detached context for the QR channel so the pairing session
-	// survives after the HTTP response is sent. The HTTP request context
-	// has a short timeout (e.g. 45s) which would cancel the QR emitter
-	// and disconnect the client before the user can scan the code.
-	// Total QR window: ~160s (first code 60s + five codes at 20s each).
 	qrCtx, qrCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 
-	chImage := make(chan string, 1) // Buffered to prevent goroutine leak
+	chImage := make(chan string, 1)
 	ch, err := client.GetQRChannel(qrCtx)
 	if err != nil {
 		qrCancel()
@@ -73,7 +66,7 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 
 	go func() {
 		defer qrCancel()
-		defer close(chImage) // Ensure channel is closed when done
+		defer close(chImage)
 		for evt := range ch {
 			response.Code = evt.Code
 			response.Duration = evt.Timeout / time.Second / 2
@@ -81,7 +74,7 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 				qrPath := fmt.Sprintf("%s/scan-qr-%s.png", config.PathQrCode, fiberUtils.UUIDv4())
 				if err := qrcode.WriteFile(evt.Code, qrcode.Medium, 512, qrPath); err != nil {
 					logrus.Errorf("[LOGIN][%s] Error when write qr code to file: %v", deviceID, err)
-					continue // Skip sending if QR generation failed
+					continue
 				}
 				go func(path string, duration time.Duration) {
 					time.Sleep(duration * time.Second)
@@ -92,7 +85,6 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 				select {
 				case chImage <- qrPath:
 				case <-qrCtx.Done():
-					logrus.Warnf("[LOGIN][%s] QR context canceled while sending QR path", deviceID)
 					return
 				}
 			} else {
@@ -109,7 +101,6 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 
 	instance.UpdateStateFromClient()
 
-	// Wait for QR image with timeout to prevent hanging
 	select {
 	case imagePath, ok := <-chImage:
 		if !ok {
@@ -141,7 +132,6 @@ func (service *serviceApp) LoginWithCode(ctx context.Context, deviceID string, p
 		return loginCode, pkgError.ErrAlreadyLoggedIn
 	}
 
-	// Connect before requesting pairing code.
 	if !client.IsConnected() {
 		if err = client.Connect(); err != nil {
 			return loginCode, err
@@ -156,7 +146,6 @@ func (service *serviceApp) LoginWithCode(ctx context.Context, deviceID string, p
 	}
 
 	instance.UpdateStateFromClient()
-	logrus.Infof("Successfully paired phone with code: %s", loginCode)
 	return loginCode, nil
 }
 
@@ -166,21 +155,17 @@ func (service *serviceApp) Logout(ctx context.Context, deviceID string) error {
 	}
 
 	if err := service.deviceManager.PurgeDevice(ctx, deviceID); err != nil {
-		logrus.WithError(err).Warnf("[LOGOUT][%s] purge completed with warnings", deviceID)
 		return err
 	}
 
-	// Broadcast device removal so UI can refresh without manual polling
 	var devices []domainApp.DevicesResponse
 	if list, err := service.FetchDevices(ctx); err == nil {
 		devices = list
-	} else {
-		logrus.WithError(err).Warn("[LOGOUT] failed to fetch devices after purge")
 	}
 
 	websocket.Broadcast <- websocket.BroadcastMessage{
 		Code:    "DEVICE_REMOVED",
-		Message: fmt.Sprintf("Device %s logged out and removed", deviceID),
+		Message: fmt.Sprintf("Device %s logged out", deviceID),
 		Result: map[string]any{
 			"device_id": deviceID,
 			"devices":   devices,
@@ -196,16 +181,9 @@ func (service *serviceApp) Reconnect(_ context.Context, deviceID string) (err er
 		return err
 	}
 
-	if client.Store == nil || client.Store.ID == nil {
-		return fmt.Errorf("device %s is not logged in (session deleted)", deviceID)
-	}
-
 	client.Disconnect()
 	err = client.Connect()
 	instance.UpdateStateFromClient()
-	if err != nil {
-		logrus.Errorf("[RECONNECT][%s] Reconnect failed: %v", deviceID, err)
-	}
 	return err
 }
 
@@ -221,11 +199,7 @@ func (service *serviceApp) Status(_ context.Context, deviceID string) (bool, boo
 
 	instance.UpdateStateFromClient()
 	client := instance.GetClient()
-	if client == nil {
-		return false, false, nil
-	}
-
-	if client.Store == nil || client.Store.ID == nil {
+	if client == nil || client.Store == nil || client.Store.ID == nil {
 		return false, false, nil
 	}
 
